@@ -23,10 +23,52 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	cookie, err := req.Cookie("Authorization")
 	if err == nil && strings.HasPrefix(cookie.Value, "Bearer ") {
 		token := strings.TrimPrefix(cookie.Value, "Bearer ")
-		fmt.Printf("token = %+v\n", token)
 
+		// Verifica si el token está expirado
+		if isTokenExpired(token) {
+			// Intenta refrescar el token si hay un refresh token
+			refreshCookie, err := req.Cookie("RefreshToken")
+			if err == nil && refreshCookie.Value != "" {
+				newToken, err := k.refreshToken(refreshCookie.Value)
+				if err == nil {
+					// Actualiza el token en las cookies
+					authCookie := &http.Cookie{
+						Name:     "Authorization",
+						Value:    "Bearer " + newToken,
+						Secure:   true,
+						HttpOnly: true,
+						Path:     "/",
+						SameSite: http.SameSiteLaxMode,
+					}
+
+					tokenCookie := &http.Cookie{
+						Name:     k.TokenCookieName,
+						Value:    newToken,
+						Secure:   true,
+						HttpOnly: true,
+						Path:     "/",
+						SameSite: http.SameSiteLaxMode,
+					}
+
+					http.SetCookie(rw, authCookie)
+					http.SetCookie(rw, tokenCookie)
+
+					// Actualiza el token actual
+					token = newToken
+				} else {
+					// Si el refresh falla, redirige a keycloak
+					k.redirectToKeycloak(rw, req)
+					return
+				}
+			} else {
+				// Si no hay refresh token, redirige a keycloak
+				k.redirectToKeycloak(rw, req)
+				return
+			}
+		}
+
+		// Continúa con la verificación normal
 		ok, err := k.verifyToken(token)
-		fmt.Printf("ok = %+v\n", ok)
 		if err != nil {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
@@ -80,7 +122,7 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 
 		fmt.Printf("exchange auth code called\n")
-		token, err := k.exchangeAuthCode(req, authCode, stateBase64)
+		token, refreshToken, err := k.exchangeAuthCode(req, authCode, stateBase64)
 		fmt.Printf("exchange auth code finished %+v\n", token)
 		if err != nil {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
@@ -117,6 +159,17 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		http.SetCookie(rw, tokenCookie)
 		req.AddCookie(tokenCookie) // Add the cookie to the request so it is present on the initial redirect below.
 
+		// Añade una cookie para el refresh token
+		refreshTokenCookie := &http.Cookie{
+			Name:     "RefreshToken",
+			Value:    refreshToken,
+			Secure:   true,
+			HttpOnly: true,
+			Path:     "/",
+			SameSite: http.SameSiteLaxMode,
+		}
+		http.SetCookie(rw, refreshTokenCookie)
+
 		qry := req.URL.Query()
 		qry.Del("code")
 		qry.Del("state")
@@ -152,12 +205,12 @@ func extractClaims(tokenString string, claimName string) (string, error) {
 	return "", fmt.Errorf("missing claim %s", claimName)
 }
 
-func (k *keycloakAuth) exchangeAuthCode(req *http.Request, authCode string, stateBase64 string) (string, error) {
+func (k *keycloakAuth) exchangeAuthCode(req *http.Request, authCode string, stateBase64 string) (string, string, error) {
 	stateBytes, _ := base64.StdEncoding.DecodeString(stateBase64)
 	var state state
 	err := json.Unmarshal(stateBytes, &state)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	target := k.KeycloakURL.JoinPath(
@@ -179,22 +232,22 @@ func (k *keycloakAuth) exchangeAuthCode(req *http.Request, authCode string, stat
 		})
 
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", errors.New("received bad response from Keycloak: " + string(body))
+		return "", "", errors.New("received bad response from Keycloak: " + string(body))
 	}
 
 	var tokenResponse KeycloakTokenResponse
 	err = json.NewDecoder(resp.Body).Decode(&tokenResponse)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	return tokenResponse.AccessToken, nil
+	return tokenResponse.AccessToken, tokenResponse.RefreshToken, nil
 }
 
 func (k *keycloakAuth) redirectToKeycloak(rw http.ResponseWriter, req *http.Request) {
@@ -274,4 +327,83 @@ func (k *keycloakAuth) verifyToken(token string) (bool, error) {
 	}
 
 	return introspectResponse["active"].(bool), nil
+}
+
+func (k *keycloakAuth) refreshToken(refreshToken string) (string, error) {
+	target := k.KeycloakURL.JoinPath(
+		"realms",
+		k.KeycloakRealm,
+		"protocol",
+		"openid-connect",
+		"token",
+	)
+
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: k.InsecureSkipVerify},
+	}
+	client := &http.Client{Transport: tr}
+
+	data := url.Values{
+		"grant_type":    {"refresh_token"},
+		"client_id":     {k.ClientID},
+		"client_secret": {k.ClientSecret},
+		"refresh_token": {refreshToken},
+	}
+
+	req, err := http.NewRequest(
+		http.MethodPost,
+		target.String(),
+		strings.NewReader(data.Encode()),
+	)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", errors.New("received bad response from Keycloak refresh token: " + string(body))
+	}
+
+	var tokenResponse KeycloakTokenResponse
+	err = json.NewDecoder(resp.Body).Decode(&tokenResponse)
+	if err != nil {
+		return "", err
+	}
+
+	return tokenResponse.AccessToken, nil
+}
+
+func isTokenExpired(token string) bool {
+	jwtContent := strings.Split(token, ".")
+	if len(jwtContent) < 3 {
+		return true
+	}
+
+	var jwtClaims map[string]interface{}
+	decoder := base64.StdEncoding.WithPadding(base64.NoPadding)
+
+	jwt_bytes, err := decoder.DecodeString(jwtContent[1])
+	if err != nil {
+		return true
+	}
+
+	if err := json.Unmarshal(jwt_bytes, &jwtClaims); err != nil {
+		return true
+	}
+
+	// Verifica el campo exp (expiration time)
+	if exp, ok := jwtClaims["exp"].(float64); ok {
+		// Agrega margen de 30 segundos
+		return time.Now().Unix() > int64(exp)-30
+	}
+
+	return true
 }
