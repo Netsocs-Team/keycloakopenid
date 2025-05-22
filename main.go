@@ -251,6 +251,19 @@ func (k *keycloakAuth) exchangeAuthCode(req *http.Request, authCode string, stat
 }
 
 func (k *keycloakAuth) redirectToKeycloak(rw http.ResponseWriter, req *http.Request) {
+	// Verificar si es una llamada API
+	isAPIRequest := req.Header.Get("Accept") == "application/json" ||
+		req.Header.Get("X-Requested-With") == "XMLHttpRequest"
+
+	if isAPIRequest {
+		// Para llamadas API, devolver 401 y un header especial
+		rw.Header().Set("X-Auth-Required", "true")
+		rw.Header().Set("X-Auth-Location", k.getKeycloakAuthURL(req))
+		http.Error(rw, "Authentication required", http.StatusUnauthorized)
+		return
+	}
+
+	// Para peticiones normales, continuar con el redirect
 	// Eliminar las cookies existentes
 	cookies := []string{"Authorization", "RefreshToken", k.TokenCookieName}
 	for _, cookieName := range cookies {
@@ -290,6 +303,37 @@ func (k *keycloakAuth) redirectToKeycloak(rw http.ResponseWriter, req *http.Requ
 	}.Encode()
 
 	http.Redirect(rw, req, redirectURL.String(), http.StatusTemporaryRedirect)
+}
+
+// Nueva función para obtener la URL de autenticación
+func (k *keycloakAuth) getKeycloakAuthURL(req *http.Request) string {
+	scheme := req.Header.Get("X-Forwarded-Proto")
+	host := req.Header.Get("X-Forwarded-Host")
+	originalURL := fmt.Sprintf("%s://%s%s", scheme, host, req.RequestURI)
+
+	state := state{
+		RedirectURL: originalURL,
+	}
+
+	stateBytes, _ := json.Marshal(state)
+	stateBase64 := base64.StdEncoding.EncodeToString(stateBytes)
+
+	redirectURL := k.KeycloakURL.JoinPath(
+		"realms",
+		k.KeycloakRealm,
+		"protocol",
+		"openid-connect",
+		"auth",
+	)
+	redirectURL.RawQuery = url.Values{
+		"response_type": {"code"},
+		"client_id":     {k.ClientID},
+		"redirect_uri":  {originalURL},
+		"state":         {stateBase64},
+		"scope":         {k.Scope},
+	}.Encode()
+
+	return redirectURL.String()
 }
 
 func (k *keycloakAuth) verifyToken(token string) (bool, error) {
