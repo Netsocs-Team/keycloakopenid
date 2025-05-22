@@ -251,6 +251,18 @@ func (k *keycloakAuth) exchangeAuthCode(req *http.Request, authCode string, stat
 }
 
 func (k *keycloakAuth) redirectToKeycloak(rw http.ResponseWriter, req *http.Request) {
+	// Eliminar las cookies existentes
+	cookies := []string{"Authorization", "RefreshToken", k.TokenCookieName}
+	for _, cookieName := range cookies {
+		http.SetCookie(rw, &http.Cookie{
+			Name:    cookieName,
+			Value:   "",
+			Path:    "/",
+			Expires: time.Now().Add(-24 * time.Hour),
+			MaxAge:  -1,
+		})
+	}
+
 	scheme := req.Header.Get("X-Forwarded-Proto")
 	host := req.Header.Get("X-Forwarded-Host")
 	originalURL := fmt.Sprintf("%s://%s%s", scheme, host, req.RequestURI)
