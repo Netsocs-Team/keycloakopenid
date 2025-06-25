@@ -1,6 +1,7 @@
 package keycloakopenid
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -13,6 +14,37 @@ import (
 	"time"
 )
 
+var LongSessionPaths = []string{
+	"/api/netsocs/dh/ws/v1/config_communication",
+	"/api/netsocs/dh/objects",
+}
+
+var validateLongSessionURL = "http://netsocs-driverhub-service:3196/auth/validate"
+
+func validateLongSession(token string) bool {
+
+	req, err := http.NewRequest("POST", validateLongSessionURL, nil)
+	if err != nil {
+		return false
+	}
+
+	body, err := json.Marshal(map[string]string{
+		"token": token,
+	})
+	if err != nil {
+		return false
+	}
+	req.Body = io.NopCloser(bytes.NewBuffer(body))
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
 func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	for _, substr := range k.IgnorePathPrefixes {
 		if strings.Contains(req.URL.Path, substr) {
@@ -20,6 +52,23 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
+
+	for _, path := range LongSessionPaths {
+		if strings.HasPrefix(req.URL.Path, path) {
+			token := req.Header.Get("X-Auth-Token")
+			if token == "" {
+				break
+			}
+			token = strings.TrimPrefix(token, "Bearer ")
+			valid := validateLongSession(token)
+			if !valid {
+				break
+			}
+			k.next.ServeHTTP(rw, req)
+			return
+		}
+	}
+
 	cookie, err := req.Cookie("Authorization")
 	if err == nil && strings.HasPrefix(cookie.Value, "Bearer ") {
 		token := strings.TrimPrefix(cookie.Value, "Bearer ")
