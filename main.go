@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -53,16 +54,21 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	os.Stdout.WriteString(req.URL.Path)
+
 	for _, path := range LongSessionPaths {
 		if strings.HasPrefix(req.URL.Path, path) {
+			os.Stdout.WriteString(fmt.Sprintf("Long session path: %s\n", req.URL.Path))
 			token := req.Header.Get("X-Auth-Token")
 			if token == "" {
-				break
+				rw.Write([]byte("No token found"))
+				return
 			}
 			token = strings.TrimPrefix(token, "Bearer ")
 			valid := validateLongSession(token)
 			if !valid {
-				break
+				rw.Write([]byte("Invalid token"))
+				return
 			}
 			k.next.ServeHTTP(rw, req)
 			return
