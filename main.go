@@ -16,6 +16,7 @@ import (
 
 var LongSessionPaths = []string{
 	"/api/netsocs/dh/ws/v1/config_communication",
+	"api/netsocs/dh/ws/v1/config_smartconnect",
 	"/api/netsocs/dh/objects",
 }
 
