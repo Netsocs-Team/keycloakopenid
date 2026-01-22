@@ -47,6 +47,15 @@ func validateLongSession(token string) bool {
 }
 
 func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	// Añadir cookie de versión en todas las requests
+	versionCookie := &http.Cookie{
+		Name:     "plugin_version",
+		Value:    "v1.0.9",
+		Path:     "/",
+		SameSite: http.SameSiteLaxMode,
+	}
+	http.SetCookie(rw, versionCookie)
+
 	for _, substr := range k.IgnorePathPrefixes {
 		if strings.Contains(req.URL.Path, substr) {
 			k.next.ServeHTTP(rw, req)
