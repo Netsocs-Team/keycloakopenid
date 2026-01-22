@@ -50,7 +50,7 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Añadir cookie de versión en todas las requests
 	versionCookie := &http.Cookie{
 		Name:     "plugin_version",
-		Value:    "v1.0.9",
+		Value:    "v1.0.10",
 		Path:     "/",
 		SameSite: http.SameSiteLaxMode,
 	}
