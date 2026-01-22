@@ -183,7 +183,12 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		token, refreshToken, err := k.exchangeAuthCode(req, authCode, stateBase64)
 		fmt.Printf("exchange auth code finished %+v\n", token)
 		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			// En caso de error, redirigir al hostname base
+			scheme := req.Header.Get("X-Forwarded-Proto")
+			host := req.Header.Get("X-Forwarded-Host")
+			baseURL := fmt.Sprintf("%s://%s/", scheme, host)
+			fmt.Printf("Error exchanging auth code, redirecting to base URL: %s\n", baseURL)
+			http.Redirect(rw, req, baseURL, http.StatusTemporaryRedirect)
 			return
 		}
 
