@@ -63,11 +63,6 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	msg := fmt.Sprintf("Long session path: %s\n", req.URL.Path)
-	msg += fmt.Sprintf("Long session paths: %v\n", LongSessionPaths)
-
-	rw.Write([]byte(msg))
-
 	for _, path := range LongSessionPaths {
 		if strings.HasPrefix(req.URL.Path, path) {
 			os.Stdout.WriteString(fmt.Sprintf("Long session path: %s\n", req.URL.Path))
