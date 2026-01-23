@@ -2,6 +2,7 @@ package keycloakopenid
 
 import (
 	"context"
+	"crypto/rsa"
 	"errors"
 	"fmt"
 	"net/http"
@@ -50,6 +51,11 @@ type keycloakAuth struct {
 	UserClaimName      string
 	UserHeaderName     string
 	IgnorePathPrefixes []string
+	// JWKS fields for local JWT validation
+	jwksCache        *JWKSCache
+	jwksURI          string
+	expectedIssuer   string
+	expectedAudience string
 }
 
 type KeycloakTokenResponse struct {
@@ -230,6 +236,11 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		ignorePathPrefixes = strings.Split(config.IgnorePathPrefixes, ",")
 	}
 
+	// Build JWKS URI and expected issuer from KeycloakURL
+	jwksURI := parsedURL.JoinPath("auth", "realms", "netsocs", "protocol", "openid-connect", "certs").String()
+	expectedIssuer := parsedURL.JoinPath("auth", "realms", "netsocs").String()
+	expectedAudience := "netsocs-kc"
+
 	return &keycloakAuth{
 		next:               next,
 		KeycloakURL:        parsedURL,
@@ -243,5 +254,10 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		UserHeaderName:     userHeaderName,
 		IgnorePathPrefixes: ignorePathPrefixes,
 		InsecureSkipVerify: config.InsecureSkipVerify,
+		// JWKS fields
+		jwksCache:        &JWKSCache{keys: make(map[string]*rsa.PublicKey)},
+		jwksURI:          jwksURI,
+		expectedIssuer:   expectedIssuer,
+		expectedAudience: expectedAudience,
 	}, nil
 }

@@ -2,18 +2,60 @@ package keycloakopenid
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
+
+// JWK representa una clave del JWKS
+type JWK struct {
+	Kty string `json:"kty"`
+	Use string `json:"use"`
+	Kid string `json:"kid"`
+	Alg string `json:"alg"`
+	N   string `json:"n"`
+	E   string `json:"e"`
+}
+
+// JWKS representa el set de claves
+type JWKS struct {
+	Keys []JWK `json:"keys"`
+}
+
+// JWKSCache para cachear las claves públicas
+type JWKSCache struct {
+	keys      map[string]*rsa.PublicKey
+	fetchedAt time.Time
+	mu        sync.RWMutex
+}
+
+// JWTHeader para parsear el header del JWT
+type JWTHeader struct {
+	Alg string `json:"alg"`
+	Kid string `json:"kid"`
+}
+
+// JWTClaims para validar los claims
+type JWTClaims struct {
+	Iss string      `json:"iss"`
+	Aud interface{} `json:"aud"`
+	Azp string      `json:"azp"`
+	Exp int64       `json:"exp"`
+	Iat int64       `json:"iat"`
+}
 
 var LongSessionPaths = []string{
 	"/api/netsocs/dh/ws/v1/config_communication",
@@ -50,7 +92,7 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Añadir cookie de versión en todas las requests
 	versionCookie := &http.Cookie{
 		Name:     "plugin_version",
-		Value:    "v1.0.10",
+		Value:    "v1.0.12",
 		Path:     "/",
 		SameSite: http.SameSiteLaxMode,
 	}
@@ -403,53 +445,253 @@ func (k *keycloakAuth) getKeycloakAuthURL(req *http.Request) string {
 	return redirectURL.String()
 }
 
-func (k *keycloakAuth) verifyToken(token string) (bool, error) {
+// base64URLDecode decodes a base64url string without padding
+func base64URLDecode(s string) ([]byte, error) {
+	// Add padding if needed
+	switch len(s) % 4 {
+	case 2:
+		s += "=="
+	case 3:
+		s += "="
+	}
+	return base64.URLEncoding.DecodeString(s)
+}
+
+// parseRSAPublicKey converts a JWK to an RSA public key
+func parseRSAPublicKey(jwk JWK) (*rsa.PublicKey, error) {
+	if jwk.Kty != "RSA" {
+		return nil, fmt.Errorf("unsupported key type: %s", jwk.Kty)
+	}
+
+	// Decode modulus (n)
+	nBytes, err := base64URLDecode(jwk.N)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode modulus: %v", err)
+	}
+	n := new(big.Int).SetBytes(nBytes)
+
+	// Decode exponent (e)
+	eBytes, err := base64URLDecode(jwk.E)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode exponent: %v", err)
+	}
+	// Convert exponent bytes to int
+	var e int
+	for _, b := range eBytes {
+		e = e<<8 + int(b)
+	}
+
+	return &rsa.PublicKey{N: n, E: e}, nil
+}
+
+// fetchJWKS fetches the JWKS from the endpoint
+func (k *keycloakAuth) fetchJWKS() (*JWKS, error) {
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: k.InsecureSkipVerify},
 	}
+	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
 
-	client := &http.Client{Transport: tr}
-
-	data := url.Values{
-		"token": {token},
-	}
-
-	req, err := http.NewRequest(
-		http.MethodPost,
-		k.KeycloakURL.JoinPath(
-			"realms",
-			k.KeycloakRealm,
-			"protocol",
-			"openid-connect",
-			"token",
-			"introspect",
-		).String(),
-		strings.NewReader(data.Encode()),
-	)
+	resp, err := client.Get(k.jwksURI)
 	if err != nil {
-		return false, err
-	}
-
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-	req.SetBasicAuth(k.ClientID, k.ClientSecret)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return false, err
+		return nil, fmt.Errorf("failed to fetch JWKS: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return false, nil
+		return nil, fmt.Errorf("JWKS endpoint returned status %d", resp.StatusCode)
 	}
 
-	var introspectResponse map[string]interface{}
-	err = json.NewDecoder(resp.Body).Decode(&introspectResponse)
+	var jwks JWKS
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		return nil, fmt.Errorf("failed to decode JWKS: %v", err)
+	}
+
+	return &jwks, nil
+}
+
+// refreshJWKS updates the cache of public keys
+func (k *keycloakAuth) refreshJWKS() error {
+	jwks, err := k.fetchJWKS()
+	if err != nil {
+		return err
+	}
+
+	newKeys := make(map[string]*rsa.PublicKey)
+	for _, jwk := range jwks.Keys {
+		if jwk.Use == "sig" && (jwk.Alg == "" || jwk.Alg == "RS256") {
+			pubKey, err := parseRSAPublicKey(jwk)
+			if err != nil {
+				continue // Skip keys that fail to parse
+			}
+			newKeys[jwk.Kid] = pubKey
+		}
+	}
+
+	k.jwksCache.mu.Lock()
+	k.jwksCache.keys = newKeys
+	k.jwksCache.fetchedAt = time.Now()
+	k.jwksCache.mu.Unlock()
+
+	return nil
+}
+
+// getPublicKey returns a public key by kid, refreshing cache if necessary
+func (k *keycloakAuth) getPublicKey(kid string) (*rsa.PublicKey, error) {
+	k.jwksCache.mu.RLock()
+	cacheAge := time.Since(k.jwksCache.fetchedAt)
+	key, exists := k.jwksCache.keys[kid]
+	k.jwksCache.mu.RUnlock()
+
+	// If key exists and cache is fresh (< 5 minutes), return it
+	if exists && cacheAge < 5*time.Minute {
+		return key, nil
+	}
+
+	// Refresh cache if expired or key not found
+	if cacheAge >= 5*time.Minute || !exists {
+		if err := k.refreshJWKS(); err != nil {
+			// If refresh fails but we have a cached key, use it
+			if exists {
+				return key, nil
+			}
+			return nil, fmt.Errorf("failed to refresh JWKS and no cached key: %v", err)
+		}
+
+		// Try to get the key again after refresh
+		k.jwksCache.mu.RLock()
+		key, exists = k.jwksCache.keys[kid]
+		k.jwksCache.mu.RUnlock()
+
+		if !exists {
+			return nil, fmt.Errorf("key with kid %s not found in JWKS", kid)
+		}
+	}
+
+	return key, nil
+}
+
+// parseJWT parses a JWT and returns header, claims, and signature
+func parseJWT(token string) (*JWTHeader, *JWTClaims, []byte, string, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, nil, nil, "", errors.New("malformed JWT: expected 3 parts")
+	}
+
+	// Decode and parse header
+	headerBytes, err := base64URLDecode(parts[0])
+	if err != nil {
+		return nil, nil, nil, "", fmt.Errorf("failed to decode JWT header: %v", err)
+	}
+	var header JWTHeader
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return nil, nil, nil, "", fmt.Errorf("failed to parse JWT header: %v", err)
+	}
+
+	// Decode and parse claims
+	claimsBytes, err := base64URLDecode(parts[1])
+	if err != nil {
+		return nil, nil, nil, "", fmt.Errorf("failed to decode JWT claims: %v", err)
+	}
+	var claims JWTClaims
+	if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+		return nil, nil, nil, "", fmt.Errorf("failed to parse JWT claims: %v", err)
+	}
+
+	// Decode signature
+	signature, err := base64URLDecode(parts[2])
+	if err != nil {
+		return nil, nil, nil, "", fmt.Errorf("failed to decode JWT signature: %v", err)
+	}
+
+	// Signed content is header.claims (without signature)
+	signedContent := parts[0] + "." + parts[1]
+
+	return &header, &claims, signature, signedContent, nil
+}
+
+// verifySignature verifies the RS256 signature
+func verifySignature(signedContent string, signature []byte, pubKey *rsa.PublicKey) error {
+	hash := sha256.Sum256([]byte(signedContent))
+	return rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, hash[:], signature)
+}
+
+// validateClaims validates the JWT claims
+func (k *keycloakAuth) validateClaims(claims *JWTClaims) error {
+	now := time.Now().Unix()
+
+	// Validate issuer
+	if claims.Iss != k.expectedIssuer {
+		return fmt.Errorf("invalid issuer: expected %s, got %s", k.expectedIssuer, claims.Iss)
+	}
+
+	// Validate audience (can be string or array)
+	audValid := false
+	switch aud := claims.Aud.(type) {
+	case string:
+		audValid = aud == k.expectedAudience
+	case []interface{}:
+		for _, a := range aud {
+			if str, ok := a.(string); ok && str == k.expectedAudience {
+				audValid = true
+				break
+			}
+		}
+	}
+	// Also check azp (authorized party) as fallback
+	if !audValid && claims.Azp == k.expectedAudience {
+		audValid = true
+	}
+	if !audValid {
+		return fmt.Errorf("invalid audience: expected %s", k.expectedAudience)
+	}
+
+	// Validate expiration (with 30 second tolerance)
+	if claims.Exp < now-30 {
+		return errors.New("token has expired")
+	}
+
+	// Validate issued at (not in the future with 30 second tolerance)
+	if claims.Iat > now+30 {
+		return errors.New("token issued in the future")
+	}
+
+	return nil
+}
+
+// verifyTokenLocally validates a JWT token locally using JWKS
+func (k *keycloakAuth) verifyTokenLocally(token string) (bool, error) {
+	// Parse the JWT
+	header, claims, signature, signedContent, err := parseJWT(token)
 	if err != nil {
 		return false, err
 	}
 
-	return introspectResponse["active"].(bool), nil
+	// Verify algorithm is RS256
+	if header.Alg != "RS256" {
+		return false, fmt.Errorf("unsupported algorithm: %s", header.Alg)
+	}
+
+	// Get the public key
+	pubKey, err := k.getPublicKey(header.Kid)
+	if err != nil {
+		return false, err
+	}
+
+	// Verify signature
+	if err := verifySignature(signedContent, signature, pubKey); err != nil {
+		return false, errors.New("invalid signature")
+	}
+
+	// Validate claims
+	if err := k.validateClaims(claims); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+func (k *keycloakAuth) verifyToken(token string) (bool, error) {
+	return k.verifyTokenLocally(token)
 }
 
 func (k *keycloakAuth) refreshToken(refreshToken string) (string, error) {
