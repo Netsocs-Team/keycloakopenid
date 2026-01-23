@@ -493,17 +493,18 @@ func (k *keycloakAuth) fetchJWKS() (*JWKS, error) {
 
 	resp, err := client.Get(k.jwksURI)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch JWKS: %v", err)
+		return nil, fmt.Errorf("failed to fetch JWKS from %s: %v", k.jwksURI, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("JWKS endpoint returned status %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("JWKS endpoint %s returned status %d, body: %s", k.jwksURI, resp.StatusCode, string(body))
 	}
 
 	var jwks JWKS
 	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
-		return nil, fmt.Errorf("failed to decode JWKS: %v", err)
+		return nil, fmt.Errorf("failed to decode JWKS from %s: %v", k.jwksURI, err)
 	}
 
 	return &jwks, nil
@@ -540,6 +541,10 @@ func (k *keycloakAuth) getPublicKey(kid string) (*rsa.PublicKey, error) {
 	k.jwksCache.mu.RLock()
 	cacheAge := time.Since(k.jwksCache.fetchedAt)
 	key, exists := k.jwksCache.keys[kid]
+	cachedKids := make([]string, 0, len(k.jwksCache.keys))
+	for k := range k.jwksCache.keys {
+		cachedKids = append(cachedKids, k)
+	}
 	k.jwksCache.mu.RUnlock()
 
 	// If key exists and cache is fresh (< 5 minutes), return it
@@ -554,16 +559,20 @@ func (k *keycloakAuth) getPublicKey(kid string) (*rsa.PublicKey, error) {
 			if exists {
 				return key, nil
 			}
-			return nil, fmt.Errorf("failed to refresh JWKS and no cached key: %v", err)
+			return nil, fmt.Errorf("failed to refresh JWKS and no cached key (jwksURI=%s, kid=%s): %v", k.jwksURI, kid, err)
 		}
 
 		// Try to get the key again after refresh
 		k.jwksCache.mu.RLock()
 		key, exists = k.jwksCache.keys[kid]
+		cachedKids = make([]string, 0, len(k.jwksCache.keys))
+		for k := range k.jwksCache.keys {
+			cachedKids = append(cachedKids, k)
+		}
 		k.jwksCache.mu.RUnlock()
 
 		if !exists {
-			return nil, fmt.Errorf("key with kid %s not found in JWKS", kid)
+			return nil, fmt.Errorf("key with kid %s not found in JWKS (jwksURI=%s, available kids=%v)", kid, k.jwksURI, cachedKids)
 		}
 	}
 
@@ -642,17 +651,17 @@ func (k *keycloakAuth) validateClaims(claims *JWTClaims) error {
 		audValid = true
 	}
 	if !audValid {
-		return fmt.Errorf("invalid audience: expected %s", k.expectedAudience)
+		return fmt.Errorf("invalid audience: expected %s, got aud=%v azp=%s", k.expectedAudience, claims.Aud, claims.Azp)
 	}
 
 	// Validate expiration (with 30 second tolerance)
 	if claims.Exp < now-30 {
-		return errors.New("token has expired")
+		return fmt.Errorf("token has expired (exp=%d, now=%d, diff=%ds)", claims.Exp, now, now-claims.Exp)
 	}
 
 	// Validate issued at (not in the future with 30 second tolerance)
 	if claims.Iat > now+30 {
-		return errors.New("token issued in the future")
+		return fmt.Errorf("token issued in the future (iat=%d, now=%d)", claims.Iat, now)
 	}
 
 	return nil
@@ -663,28 +672,28 @@ func (k *keycloakAuth) verifyTokenLocally(token string) (bool, error) {
 	// Parse the JWT
 	header, claims, signature, signedContent, err := parseJWT(token)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("JWT parse error: %v", err)
 	}
 
 	// Verify algorithm is RS256
 	if header.Alg != "RS256" {
-		return false, fmt.Errorf("unsupported algorithm: %s", header.Alg)
+		return false, fmt.Errorf("unsupported algorithm: %s (expected RS256)", header.Alg)
 	}
 
 	// Get the public key
 	pubKey, err := k.getPublicKey(header.Kid)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("get public key error (kid=%s): %v", header.Kid, err)
 	}
 
 	// Verify signature
 	if err := verifySignature(signedContent, signature, pubKey); err != nil {
-		return false, errors.New("invalid signature")
+		return false, fmt.Errorf("invalid signature (kid=%s, alg=%s): %v", header.Kid, header.Alg, err)
 	}
 
 	// Validate claims
 	if err := k.validateClaims(claims); err != nil {
-		return false, err
+		return false, fmt.Errorf("claims validation error: %v", err)
 	}
 
 	return true, nil

@@ -237,9 +237,9 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 	}
 
 	// Build JWKS URI and expected issuer from KeycloakURL
-	jwksURI := parsedURL.JoinPath("auth", "realms", "netsocs", "protocol", "openid-connect", "certs").String()
-	expectedIssuer := parsedURL.JoinPath("auth", "realms", "netsocs").String()
-	expectedAudience := "netsocs-kc"
+	jwksURI := parsedURL.JoinPath("realms", config.KeycloakRealm, "protocol", "openid-connect", "certs").String()
+	expectedIssuer := parsedURL.JoinPath("realms", config.KeycloakRealm).String()
+	expectedAudience := config.ClientID
 
 	return &keycloakAuth{
 		next:               next,
